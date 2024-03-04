@@ -1,11 +1,12 @@
 .POSIX:
 
-SHARED_OBJ = netlimit.so
+EXE = netlimit
 SRC = netlimit.c
 
-all: $(SHARED_OBJ)
+LDFLAGS = -lseccomp
+
+all: $(EXE)
 clean:
-	rm -f $(SHARED_OBJ)
+	rm -f $(EXE)
 
 $(SHARED_OBJ): $(SRC)
-	$(CC) $(CFLAGS) -fPIC -shared $(SRC) -o $(SHARED_OBJ)
