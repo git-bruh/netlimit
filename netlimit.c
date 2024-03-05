@@ -2,17 +2,22 @@
 #include <errno.h>
 #include <linux/if.h>
 #include <linux/seccomp.h>
+#include <poll.h>
 #include <seccomp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 // ip link add name <SOCKET_INTERFACE> link <LIVE_INTERFACE> type ipvlan mode l2
 // tc qdisc add dev <SOCKET_INTERFACE> root netem <...>
+
+static int sigPipeWrite = -1;
 
 _Noreturn static void
 panic(const char *const func) {
@@ -82,7 +87,7 @@ recvfd(int sockFd) {
 }
 
 static pid_t
-tracedProcess(int sockFd, const char *file, char *const argv[]) {
+tracedProcess(int sockPair[2], const char *file, char *const argv[]) {
 	pid_t pid = fork();
 
 	if (pid == -1) {
@@ -112,10 +117,11 @@ tracedProcess(int sockFd, const char *file, char *const argv[]) {
 		panic("seccomp_notify_fd");
 	}
 
-	sendfd(sockFd, fd);
+	sendfd(sockPair[0], fd);
 
 	close(fd);
-	close(sockFd);
+	close(sockPair[0]);
+	close(sockPair[1]);
 
 	seccomp_release(ctx);
 
@@ -126,28 +132,17 @@ tracedProcess(int sockFd, const char *file, char *const argv[]) {
 	__builtin_unreachable();
 }
 
-int
-main(int argc, char *const argv[]) {
-	if (argc < 3) {
-		return EXIT_FAILURE;
-	}
+static void
+sigchld(int signum, siginfo_t *info, void *context) {
+	(void) signum;
+	(void) info;
+	(void) context;
 
-	struct ifreq ifreq = {0};
-	snprintf(ifreq.ifr_name, sizeof(ifreq.ifr_name), "%s", argv[1]);
+	write(sigPipeWrite, &(char) {'\0'}, 1);
+}
 
-	int sockPair[2];
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockPair) == -1) {
-		panic("socketpair");
-	}
-
-	// TODO monitor
-	tracedProcess(sockPair[0], argv[2], &argv[2]);
-
-	int fd = recvfd(sockPair[1]);
-
-	close(sockPair[0]);
-	close(sockPair[1]);
-
+static void
+loop(pid_t child, int sigPipeRead, int seccompFd, struct ifreq *ifreq) {
 	struct seccomp_notif *req = NULL;
 	struct seccomp_notif_resp *resp = NULL;
 
@@ -156,9 +151,26 @@ main(int argc, char *const argv[]) {
 	}
 
 	while (true) {
+		struct pollfd fds[] = {
+		  (struct pollfd) {.fd = sigPipeRead, .events = POLLIN},
+		  (struct pollfd) {  .fd = seccompFd, .events = POLLIN},
+		};
+
+		if (poll(fds, sizeof(fds) / sizeof(*fds), -1) == -1) {
+			if (errno == EINTR) {
+				continue;
+			}
+
+			panic("poll");
+		}
+
+		if (fds[0].revents & POLLIN) {
+			break;
+		}
+
 		memset(req, 0, sizeof(*req));
 
-		if (seccomp_notify_receive(fd, req) < 0) {
+		if (seccomp_notify_receive(seccompFd, req) < 0) {
 			panic("seccomp_notify_receive");
 		}
 
@@ -172,7 +184,7 @@ main(int argc, char *const argv[]) {
 			resp->error = -errno;
 			resp->flags = req->flags;
 
-			if (seccomp_notify_respond(fd, resp) < 0) {
+			if (seccomp_notify_respond(seccompFd, resp) < 0) {
 				panic("seccomp_notify_respond");
 			}
 
@@ -181,13 +193,13 @@ main(int argc, char *const argv[]) {
 
 		if ((domain & AF_INET) || (domain & AF_INET6)) {
 			if (setsockopt(
-				  socket, SOL_SOCKET, SO_BINDTODEVICE, &ifreq, sizeof(ifreq))
+				  socket, SOL_SOCKET, SO_BINDTODEVICE, ifreq, sizeof(*ifreq))
 				== -1) {
-				perror("setsockopt");
+				panic("setsockopt");
 			}
 		}
 
-		if (ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD,
+		if (ioctl(seccompFd, SECCOMP_IOCTL_NOTIF_ADDFD,
 			  &(struct seccomp_notif_addfd) {
 				.id = req->id,
 				.flags = SECCOMP_ADDFD_FLAG_SEND,
@@ -200,6 +212,48 @@ main(int argc, char *const argv[]) {
 		close(socket);
 	}
 
-	close(fd);
+	if (waitpid(child, NULL, 0) == -1) {
+		panic("waitpid");
+	}
+
 	seccomp_notify_free(req, resp);
+}
+
+int
+main(int argc, char *const argv[]) {
+	if (argc < 3) {
+		return EXIT_FAILURE;
+	}
+
+	struct ifreq ifreq = {0};
+	snprintf(ifreq.ifr_name, sizeof(ifreq.ifr_name), "%s", argv[1]);
+
+	int sigPipe[2];
+	if (pipe(sigPipe) == -1) {
+		panic("pipe");
+	}
+
+	sigPipeWrite = sigPipe[1];
+
+	if (sigaction(SIGCHLD, &(struct sigaction) {.sa_sigaction = &sigchld}, NULL)
+		== -1) {
+		panic("sigaction");
+	}
+
+	int sockPair[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockPair) == -1) {
+		panic("socketpair");
+	}
+
+	pid_t child = tracedProcess(sockPair, argv[2], &argv[2]);
+
+	int fd = recvfd(sockPair[1]);
+	close(sockPair[0]);
+	close(sockPair[1]);
+
+	loop(child, sigPipe[0], fd, &ifreq);
+
+	close(sigPipe[0]);
+	close(sigPipe[1]);
+	close(fd);
 }
